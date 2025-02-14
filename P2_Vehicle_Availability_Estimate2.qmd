@@ -1,0 +1,287 @@
+---
+title: "P2_Vehicle_Availability_Estimate2"
+format: html
+editor: visual
+---
+
+## Load Libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(mlogit)
+library(knitr)
+library(caret) 
+```
+
+load other functions
+
+```{r}
+here("code",
+     "mlogit_helpers.R") |>
+  source()
+```
+
+```{r}
+'%!in%' <- function(x,y)!('%in%'(x,y))
+```
+
+## Load Dataset
+
+household-level data
+
+```{r}
+hh_data2 <- here("data",
+                "NHTS",
+                "hhpub.csv") |>
+  read_csv(show_col_types = FALSE)
+```
+
+person-level data
+
+```{r}
+person_data2 <- here("data",
+                    "NHTS",
+                    "perpub.csv") |>
+  read_csv(show_col_types = FALSE)
+```
+
+## Construct Variables
+
+household-level data
+
+```{r}
+hh_data2 <- hh_data2 |>
+  select(WRKCOUNT,
+         DRVRCNT,
+         HHVEHCNT,
+         HHSIZE,
+         NUMADLT,
+         HHFAMINC,
+         HBPPOPDN,
+         HOUSEID,
+         HBHUR)
+```
+
+person-level data
+
+### Outcome: Vehicle Availability
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(veh_avail = case_when(HHVEHCNT == 0 ~ "Zero",
+                               DRVRCNT > HHVEHCNT ~ "Insuff.",
+                               TRUE ~ "Suff."))
+```
+
+### Predictor: Number of Children
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(n_child = HHSIZE - NUMADLT)
+```
+
+### Predictor: Number of Seniors
+
+```{r}
+n_seniors2 <- person_data2 |>
+  mutate(is_senior = R_AGE > 64) |>
+  group_by(HOUSEID) |>
+  summarise(n_seniors2 = sum(is_senior))
+
+hh_data2 <- hh_data2 |>
+  left_join(n_seniors2)
+```
+
+### Predictor: Presence of a Third Driver
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(three_drivers = DRVRCNT > 2)
+```
+
+### Predictor: Number of Drivers Beyond 2
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(n_extra_drivers = ifelse(three_drivers, DRVRCNT - 2, 0))
+```
+
+### Predictor: Income
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(HHFAMINC = as.numeric(HHFAMINC)) |>
+  filter(HHFAMINC > 0) |>
+  mutate(income = case_when(HHFAMINC < 4 ~ "low",
+                             HHFAMINC < 5 & HHSIZE > 1 ~ "low",
+                             HHFAMINC < 6 & HHSIZE > 3 ~ "low",
+                             HHFAMINC < 7 & HHSIZE > 5 ~ "low",
+                             HHFAMINC < 8 & HHSIZE > 7 ~ "low",
+                             HHFAMINC > 8 ~ "high",
+                            TRUE ~ "medium")) |>
+    mutate(income = factor(income, levels = c("medium", "low", "high")))
+```
+
+### family income and household size interaction
+
+```{r}
+hh_data2 <- hh_data2 %>%
+  mutate(income_HHSIZE_interaction = HHFAMINC * HHSIZE)
+```
+
+### Predictor: Non-worker Driver
+
+```{r}
+non_work_driver2 <- person_data2 |>
+  mutate(non_work_driver = WORKER == "02" & DRIVER == "01") |>
+  group_by(HOUSEID) |>
+  summarise(non_work_driver2 = max(non_work_driver))
+
+hh_data2 <- hh_data2 |>
+  left_join(non_work_driver2)
+```
+
+### Predictor: Density
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(density_cont = HBPPOPDN)
+```
+
+### Predictor: Urban Rural Indicator
+
+```{r}
+hh_data2 <- hh_data2 |>
+  mutate(HBHUR = as.character(HBHUR)) |>
+  filter(HBHUR != "-9") |>
+  mutate(hbur_level = case_when(
+    HBHUR == "U" ~ "high",        # Urban areas could be categorized as 'high'
+    HBHUR == "S" ~ "medium",      # Suburban areas as 'medium'
+    HBHUR == "C" ~ "medium",      # Second cities as 'medium'
+    HBHUR == "T" ~ "low",         # Small towns as 'low'
+    HBHUR == "R" ~ "low",         # Rural areas as 'low'
+    TRUE ~ "unknown")) |>
+  mutate(hbur_level = factor(hbur_level, levels = c("low", "medium", "high", "unknown")))
+```
+
+## Prep Variables
+
+### drop unnecessary variables
+
+```{r}
+hh_data2 <- hh_data2 |>
+  select(HOUSEID,
+         veh_avail,
+         WRKCOUNT,
+         n_child,
+         n_seniors2,
+         n_extra_drivers,
+         three_drivers,
+         non_work_driver2,
+         income,
+         density_cont,
+         income_HHSIZE_interaction,
+         hbur_level)
+```
+
+### training and test datasets
+
+```{r}
+set.seed(6455645)
+
+hh_data2_train_ids <- sample(hh_data2$HOUSEID, 
+                        size = ceiling(nrow(hh_data2)/2))
+
+hh_data2_train <- hh_data2 |>
+  filter(HOUSEID %in% hh_data2_train_ids)
+
+hh_data2_test <- hh_data2 |>
+  filter(HOUSEID %!in% hh_data2_train_ids)
+```
+
+### make dfidx data
+
+```{r}
+veh_dfidx_train2 <- fn_make_dfidx(hh_data2_train,
+                                "HOUSEID",
+                                "veh_avail")
+
+veh_dfidx_test2 <- fn_make_dfidx(hh_data2_test,
+                                "HOUSEID",
+                                "veh_avail")
+
+names(veh_dfidx_train2)
+
+class(veh_dfidx_train2$avail_choice)
+
+sum(is.na(veh_dfidx_train2$avail_choice))  # check for NAs in avail_choice
+sum(is.na(veh_dfidx_train2$choice))  # check for NAs in choice
+```
+
+## Estimate Model
+
+```{r}
+model_veh2 <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors2 +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver2 +
+                      income +
+                      density_cont +                   # continuous density
+                      income_HHSIZE_interaction | 0,   # income and household interaction
+                           veh_dfidx_train2,
+                           reflevel = "Suff.")
+```
+
+### Summary
+
+```{r}
+summary(model_veh2) 
+```
+
+## Interpret the Results
+
+### predicting probabilities
+
+```{r}
+predicts_test2 <- predict(model_veh2, veh_dfidx_test2) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data2_test)
+```
+
+```{r}
+head(predicts_test2) |>
+  kable()
+```
+
+### model reliability
+
+```{r}
+predicts_test2 <- predicts_test2 |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff.")) 
+```
+
+string to factors
+
+```{r}
+predicts_test2 <- predicts_test2 |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+```
+
+generate accuracy and reliability stats
+
+```{r}
+confusionMatrix(data = predicts_test2$most_likely,
+                reference = predicts_test2$veh_avail)
+```
