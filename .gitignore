@@ -55,6 +55,7 @@ data/NHTS/trippub.csv
 data/NHTS/vehpub.csv
 data/NHTS/hhpub1.csv
 data/NHTS/hhpub.csv
+model/zip/inputs.zip
 
 # All model input and output
 model/outputs/
